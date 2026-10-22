@@ -50,7 +50,9 @@ ACTION_IDS = {
 USER_AGENT = 'sap-core-eng/fencegce/%s/%s/ACTION/%s'
 METADATA_SERVER = 'http://metadata.google.internal/computeMetadata/v1/'
 METADATA_HEADERS = {'Metadata-Flavor': 'Google'}
-INSTANCE_LINK = 'https://www.googleapis.com/compute/v1/projects/{}/zones/{}/instances/{}'
+INSTANCE_LINK = '{}projects/{}/zones/{}/instances/{}'
+DEFAULT_UNIVERSE_DOMAIN = 'googleapis.com'
+UNIVERSE_DOMAIN_ENV = 'GOOGLE_CLOUD_UNIVERSE_DOMAIN'
 
 def run_on_fail(options):
 	if "--runonfail" in options:
@@ -63,6 +65,64 @@ def fail_fence_agent(options, message):
 def raise_fence_agent(options, message):
 	run_on_fail(options)
 	raise Exception(message)
+
+#
+# Universe domain support, e.g. for Trusted Partner Cloud (TPC) environments
+# where the Google Cloud APIs are not served on googleapis.com.
+#
+def get_universe_domain(use_metadata=True):
+	"""Returns the universe domain of the Google Cloud APIs.
+
+	Uses the GOOGLE_CLOUD_UNIVERSE_DOMAIN environment variable if set, otherwise
+	the universe domain published by the metadata server (if use_metadata is
+	set), and falls back to googleapis.com.
+	"""
+	universe_domain = os.environ.get(UNIVERSE_DOMAIN_ENV, "").strip()
+	if universe_domain:
+		logging.debug("Using universe domain %s from %s", universe_domain, UNIVERSE_DOMAIN_ENV)
+		return universe_domain
+	if not use_metadata:
+		return DEFAULT_UNIVERSE_DOMAIN
+	try:
+		universe_domain = get_metadata('universe/universe-domain', timeout=2).strip()
+	except Exception as err:
+		logging.debug("Could not read the universe domain from the metadata server, using %s: %s",
+			DEFAULT_UNIVERSE_DOMAIN, str(err))
+		return DEFAULT_UNIVERSE_DOMAIN
+	if not universe_domain:
+		return DEFAULT_UNIVERSE_DOMAIN
+	logging.debug("Using universe domain %s from the metadata server", universe_domain)
+	return universe_domain
+
+def get_universe_domain_option(options):
+	return options.get("universe_domain", DEFAULT_UNIVERSE_DOMAIN)
+
+def compute_resource_prefix(options):
+	"""Returns the prefix of Compute Engine resource links (selfLink, targetLink)."""
+	universe_domain = get_universe_domain_option(options)
+	if universe_domain == DEFAULT_UNIVERSE_DOMAIN:
+		return 'https://www.googleapis.com/compute/v1/'
+	return 'https://compute.%s/compute/v1/' % universe_domain
+
+def universe_api_uri(options, uri):
+	"""Rewrites a googleapis.com uri to the configured universe domain."""
+	universe_domain = get_universe_domain_option(options)
+	if universe_domain == DEFAULT_UNIVERSE_DOMAIN:
+		return uri
+	# Older discovery documents use www.googleapis.com/compute as the root url.
+	uri = re.sub(r"^https://www\.googleapis\.com/compute/",
+		lambda m: "https://compute.%s/compute/" % universe_domain, uri)
+	return re.sub(r"^https://([a-z0-9-]+)\.googleapis\.com/",
+		lambda m: "https://%s.%s/" % (m.group(1), universe_domain), uri)
+
+def is_google_api_uri(options, uri):
+	match = re.match(r"https:\/\/.*.googleapis.com", uri)
+	if match is not None and match.start() == 0:
+		return True
+	universe_domain = get_universe_domain_option(options)
+	if universe_domain == DEFAULT_UNIVERSE_DOMAIN:
+		return False
+	return re.match(r"https://[^/]+\.%s(/|$)" % re.escape(universe_domain), uri) is not None
 
 #
 # Will use baremetalsolution setting or the environment variable
@@ -98,14 +158,17 @@ def replace_api_uri(options, http_request):
 		if match is None or len(match.groups()) != uri_replacement["matchlength"]:
 			continue
 		replaced_uri = re.sub(uri_replacement["match"], uri_replacement["replace"], http_request.uri)
-		match = re.match(r"https:\/\/.*.googleapis.com", replaced_uri)
-		if match is None or match.start() != 0:
+		if not is_google_api_uri(options, replaced_uri):
 			logging.warning("FENCE_GCE_URI_REPLACEMENTS replace is not "
 				"targeting googleapis.com, ignoring it: %s" % replaced_uri)
 			continue
 		logging.debug("Replacing googleapis uri %s with %s" % (http_request.uri, replaced_uri))
 		http_request.uri = replaced_uri
 		break
+	universe_uri = universe_api_uri(options, http_request.uri)
+	if universe_uri != http_request.uri:
+		logging.debug("Replacing googleapis uri %s with %s" % (http_request.uri, universe_uri))
+		http_request.uri = universe_uri
 	return http_request
 
 def retry_api_execute(options, http_request):
@@ -213,7 +276,7 @@ def check_for_existing_operation(conn, options, instance, zone, operation_type):
 		return False
 
 	project = options["--project"]
-	target_link = INSTANCE_LINK.format(project, zone, instance)
+	target_link = INSTANCE_LINK.format(compute_resource_prefix(options), project, zone, instance)
 	query_filter = '(targetLink = "{}") AND (operationType = "{}") AND (status = "RUNNING")'.format(target_link, operation_type)
 	result = retry_api_execute(
 			options,
@@ -534,6 +597,16 @@ def main():
 	show_docs(options, docs)
 
 	run_delay(options)
+
+	# Detect the universe domain before any Google Cloud client is created.
+	# Bare Metal Solution has no metadata server, so it only uses the
+	# environment variable.
+	options["universe_domain"] = get_universe_domain(
+		use_metadata="--baremetalsolution" not in options)
+	if options["universe_domain"] != DEFAULT_UNIVERSE_DOMAIN:
+		# Newer Google client libraries read the universe domain from the
+		# environment. Exporting it also passes it on to child processes.
+		os.environ[UNIVERSE_DOMAIN_ENV] = options["universe_domain"]
 
 	# Prepare logging
 	if options.get('--verbose') is None:
